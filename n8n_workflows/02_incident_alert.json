@@ -1,0 +1,102 @@
+{
+  "name": "DevOps Fleet — Incident Alert Router",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "devops/alert",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-alert",
+      "name": "Webhook: Alert Received",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.body.severity }}",
+              "operation": "equals",
+              "value2": "P1"
+            }
+          ]
+        }
+      },
+      "id": "if-p1",
+      "name": "Es P1?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DEVOPS_FLEET_API_URL }}/pipeline/remediate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"alert_message\": \"{{ $('Webhook: Alert Received').item.json.body.message }}\",\n  \"severity\": \"{{ $('Webhook: Alert Received').item.json.body.severity || 'P2' }}\",\n  \"alert_source\": \"{{ $('Webhook: Alert Received').item.json.body.source || 'webhook' }}\",\n  \"environment\": \"{{ $('Webhook: Alert Received').item.json.body.environment || 'production' }}\"\n}"
+      },
+      "id": "http-remediate",
+      "name": "Fleet API: Trigger Remediation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DEVOPS_FLEET_API_URL }}/pipeline/remediate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"alert_message\": \"{{ $('Webhook: Alert Received').item.json.body.message }}\",\n  \"severity\": \"{{ $('Webhook: Alert Received').item.json.body.severity || 'P2' }}\",\n  \"alert_source\": \"{{ $('Webhook: Alert Received').item.json.body.source || 'webhook' }}\",\n  \"environment\": \"{{ $('Webhook: Alert Received').item.json.body.environment || 'production' }}\"\n}"
+      },
+      "id": "http-remediate-p2",
+      "name": "Fleet API: Remediate P2/P3",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 400]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ job_id: $json.job_id, status: 'remediation_started' }) }}"
+      },
+      "id": "respond-alert",
+      "name": "Responder",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [900, 300]
+    }
+  ],
+  "connections": {
+    "Webhook: Alert Received": {
+      "main": [[{ "node": "Es P1?", "type": "main", "index": 0 }]]
+    },
+    "Es P1?": {
+      "main": [
+        [{ "node": "Fleet API: Trigger Remediation", "type": "main", "index": 0 }],
+        [{ "node": "Fleet API: Remediate P2/P3", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fleet API: Trigger Remediation": {
+      "main": [[{ "node": "Responder", "type": "main", "index": 0 }]]
+    },
+    "Fleet API: Remediate P2/P3": {
+      "main": [[{ "node": "Responder", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": ["devops-fleet", "incident"]
+}

@@ -1,0 +1,57 @@
+{
+  "name": "DevOps Fleet — Deploy Trigger",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "devops/deploy",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-deploy",
+      "name": "Webhook: Deploy Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DEVOPS_FLEET_API_URL }}/pipeline/deploy",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"environment\": \"{{ $json.body.environment || 'staging' }}\",\n  \"commit_sha\": \"{{ $json.body.commit_sha || '' }}\",\n  \"deploy_url\": \"{{ $json.body.deploy_url || '' }}\",\n  \"triggered_by\": \"{{ $json.body.triggered_by || 'n8n-webhook' }}\"\n}"
+      },
+      "id": "http-deploy",
+      "name": "Fleet API: Trigger Deploy",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "respond-deploy",
+      "name": "Responder al cliente",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [680, 300]
+    }
+  ],
+  "connections": {
+    "Webhook: Deploy Request": {
+      "main": [[{ "node": "Fleet API: Trigger Deploy", "type": "main", "index": 0 }]]
+    },
+    "Fleet API: Trigger Deploy": {
+      "main": [[{ "node": "Responder al cliente", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": ["devops-fleet", "deploy"]
+}

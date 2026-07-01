@@ -1,0 +1,109 @@
+{
+  "name": "DevOps Fleet — GitHub PR Router",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "devops/github-webhook",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-github",
+      "name": "Webhook: GitHub PR Event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.body.action }}",
+              "operation": "equals",
+              "value2": "closed"
+            }
+          ],
+          "boolean": [
+            {
+              "value1": "={{ $json.body.pull_request.merged }}",
+              "value2": true
+            }
+          ]
+        },
+        "combineOperation": "all"
+      },
+      "id": "if-merged",
+      "name": "¿PR mergeado a main?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $('Webhook: GitHub PR Event').item.json.body.pull_request.base.ref }}",
+              "operation": "equals",
+              "value2": "main"
+            }
+          ]
+        }
+      },
+      "id": "if-to-main",
+      "name": "¿Base branch es main?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DEVOPS_FLEET_API_URL }}/pipeline/deploy",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"environment\": \"production\",\n  \"commit_sha\": \"{{ $('Webhook: GitHub PR Event').item.json.body.pull_request.merge_commit_sha }}\",\n  \"deploy_url\": \"{{ $env.PRODUCTION_URL }}\",\n  \"triggered_by\": \"github-pr-merge\"\n}"
+      },
+      "id": "http-deploy-prod",
+      "name": "Fleet API: Deploy to Production",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 180]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ignored\", \"reason\": \"not merged to main\" }"
+      },
+      "id": "respond-ignore",
+      "name": "Ignorar evento",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [680, 420]
+    }
+  ],
+  "connections": {
+    "Webhook: GitHub PR Event": {
+      "main": [[{ "node": "¿PR mergeado a main?", "type": "main", "index": 0 }]]
+    },
+    "¿PR mergeado a main?": {
+      "main": [
+        [{ "node": "¿Base branch es main?", "type": "main", "index": 0 }],
+        [{ "node": "Ignorar evento", "type": "main", "index": 0 }]
+      ]
+    },
+    "¿Base branch es main?": {
+      "main": [
+        [{ "node": "Fleet API: Deploy to Production", "type": "main", "index": 0 }],
+        [{ "node": "Ignorar evento", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": ["devops-fleet", "github", "deploy"]
+}

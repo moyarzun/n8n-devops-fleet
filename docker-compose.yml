@@ -1,0 +1,90 @@
+services:
+  n8n-devops-fleet:
+    build: .
+    container_name: n8n-devops-fleet
+    restart: unless-stopped
+    ports:
+      - "5679:5679"
+    environment:
+      - GENERIC_TIMEZONE=UTC
+      - TZ=UTC
+      - N8N_PORT=5679
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_OWNER=${GITHUB_OWNER}
+      - GITHUB_REPO=${GITHUB_REPO}
+      - VERCEL_TOKEN=${VERCEL_TOKEN}
+      - VERCEL_PROJECT_ID=${VERCEL_PROJECT_ID}
+      - PRODUCTION_URL=${PRODUCTION_URL}
+      - STAGING_URL=${STAGING_URL}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - DEVOPS_FLEET_API_URL=http://devops-fleet-api:8010
+    volumes:
+      - n8n_devops_data:/home/node/.n8n
+      - ./devops_scripts:/data/scripts
+      - ${WORKSPACE_DIR:-./workspace_placeholder}:/workspace
+      - ${PROJECTS_DIR:-..}:/projects
+    depends_on:
+      devops-fleet-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:5679/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  devops-fleet-api:
+    build: .
+    container_name: devops-fleet-api
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    environment:
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_OWNER=${GITHUB_OWNER}
+      - GITHUB_REPO=${GITHUB_REPO}
+      - VERCEL_TOKEN=${VERCEL_TOKEN}
+      - VERCEL_PROJECT_ID=${VERCEL_PROJECT_ID}
+      - PRODUCTION_URL=${PRODUCTION_URL}
+      - STAGING_URL=${STAGING_URL}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - FLEET_DB=/data/devops_store/devops.db
+      - GIT_CONFIG_GLOBAL=/root/.gitconfig
+    volumes:
+      - ./devops_scripts:/data/scripts
+      - ${WORKSPACE_DIR:-./workspace_placeholder}:/workspace
+      - ${PROJECTS_DIR:-..}:/projects
+      - devops_data:/data/devops_store
+    working_dir: /data/scripts
+    command: ["uvicorn", "devops_api:app", "--host", "0.0.0.0", "--port", "8010"]
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8010/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  devops-mcp-server:
+    build: .
+    container_name: devops-mcp-server
+    restart: unless-stopped
+    ports:
+      - "8011:8011"
+    environment:
+      - DEVOPS_FLEET_API_URL=http://devops-fleet-api:8010
+    volumes:
+      - ./devops_scripts:/data/scripts
+    working_dir: /data/scripts
+    command: ["uvicorn", "mcp_devops_server:mcp", "--host", "0.0.0.0", "--port", "8011"]
+    depends_on:
+      devops-fleet-api:
+        condition: service_healthy
+
+volumes:
+  n8n_devops_data:
+  devops_data:
