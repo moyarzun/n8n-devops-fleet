@@ -61,8 +61,10 @@ def _is_quota_error(exc: Exception) -> bool:
     return any(kw in msg for kw in ("429", "rate limit", "quota", "overload", "529", "capacity", "unavailable"))
 
 def _make_minimax(temperature: float) -> ChatOpenAI:
+    # Use placeholder when key is absent so the module can import without
+    # credentials; actual API calls will fail with a clear auth error.
     return ChatOpenAI(
-        api_key=MINIMAX_API_KEY,
+        api_key=MINIMAX_API_KEY or "no-key-set",
         base_url="https://api.minimax.io/v1",
         model="MiniMax-M2.7",
         temperature=temperature,
@@ -71,7 +73,7 @@ def _make_minimax(temperature: float) -> ChatOpenAI:
 
 def _make_or(model: str, temperature: float) -> ChatOpenAI:
     return ChatOpenAI(
-        api_key=OPENROUTER_API_KEY,
+        api_key=OPENROUTER_API_KEY or "no-key-set",
         base_url="https://openrouter.ai/api/v1",
         model=model,
         temperature=temperature,
@@ -80,8 +82,8 @@ def _make_or(model: str, temperature: float) -> ChatOpenAI:
         default_headers={"HTTP-Referer": "https://devops-fleet", "X-Title": "DevOps Fleet"},
     )
 
-_ANALYST_PRIMARY  = _make_minimax(0.1)   # análisis + planificación
-_REVIEWER_PRIMARY = _make_minimax(0.0)   # revisión determinista
+_ANALYST_PRIMARY  = _make_minimax(0.1)
+_REVIEWER_PRIMARY = _make_minimax(0.0)
 
 _OR_ANALYST_CHAIN = [
     _make_or("qwen/qwen3-coder:free", 0.1),
