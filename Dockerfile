@@ -37,4 +37,4 @@ WORKDIR /home/node
 
 EXPOSE 5679
 
-CMD ["n8n", "start"]
+CMD ["n8n"]
