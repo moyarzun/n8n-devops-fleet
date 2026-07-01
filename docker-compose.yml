@@ -4,7 +4,7 @@ services:
     container_name: n8n-devops-fleet
     restart: unless-stopped
     ports:
-      - "5679:5679"
+      - "5679:5676"
     environment:
       - GENERIC_TIMEZONE=UTC
       - TZ=UTC
@@ -30,7 +30,7 @@ services:
       devops-fleet-api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:5676/healthz"]
+      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:5676/healthz"]
       interval: 30s
       timeout: 10s
       retries: 5
