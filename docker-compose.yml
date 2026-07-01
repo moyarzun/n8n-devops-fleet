@@ -8,7 +8,7 @@ services:
     environment:
       - GENERIC_TIMEZONE=UTC
       - TZ=UTC
-      - N8N_PORT=5679
+      - N8N_PORT=5676
       - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
       - MINIMAX_API_KEY=${MINIMAX_API_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
@@ -30,7 +30,7 @@ services:
       devops-fleet-api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:5679/healthz"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:5676/healthz"]
       interval: 30s
       timeout: 10s
       retries: 5
