@@ -5,27 +5,18 @@ services:
     restart: unless-stopped
     ports:
       - "5679:5676"
+    env_file: .env
     environment:
       - GENERIC_TIMEZONE=UTC
       - TZ=UTC
       - N8N_PORT=5676
       - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
-      - MINIMAX_API_KEY=${MINIMAX_API_KEY}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
-      - GITHUB_OWNER=${GITHUB_OWNER}
-      - GITHUB_REPO=${GITHUB_REPO}
-      - VERCEL_TOKEN=${VERCEL_TOKEN}
-      - VERCEL_PROJECT_ID=${VERCEL_PROJECT_ID}
-      - PRODUCTION_URL=${PRODUCTION_URL}
-      - STAGING_URL=${STAGING_URL}
-      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
       - DEVOPS_FLEET_API_URL=http://devops-fleet-api:8010
     volumes:
       - n8n_devops_data:/home/node/.n8n
       - ./devops_scripts:/data/scripts
-      - ${WORKSPACE_DIR:-./workspace_placeholder}:/workspace
-      - ${PROJECTS_DIR:-..}:/projects
+      - /Users/moyarzun/vaults/sdelvillar/tennis-app/app-tennis:/workspace
+      - /Users/moyarzun/vaults/sdelvillar:/projects
     depends_on:
       devops-fleet-api:
         condition: service_healthy
@@ -42,23 +33,14 @@ services:
     restart: unless-stopped
     ports:
       - "8010:8010"
+    env_file: .env
     environment:
-      - MINIMAX_API_KEY=${MINIMAX_API_KEY}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
-      - GITHUB_OWNER=${GITHUB_OWNER}
-      - GITHUB_REPO=${GITHUB_REPO}
-      - VERCEL_TOKEN=${VERCEL_TOKEN}
-      - VERCEL_PROJECT_ID=${VERCEL_PROJECT_ID}
-      - PRODUCTION_URL=${PRODUCTION_URL}
-      - STAGING_URL=${STAGING_URL}
-      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
       - FLEET_DB=/data/devops_store/devops.db
       - GIT_CONFIG_GLOBAL=/root/.gitconfig
     volumes:
       - ./devops_scripts:/data/scripts
-      - ${WORKSPACE_DIR:-./workspace_placeholder}:/workspace
-      - ${PROJECTS_DIR:-..}:/projects
+      - /Users/moyarzun/vaults/sdelvillar/tennis-app/app-tennis:/workspace
+      - /Users/moyarzun/vaults/sdelvillar:/projects
       - devops_data:/data/devops_store
     working_dir: /data/scripts
     command: ["uvicorn", "devops_api:app", "--host", "0.0.0.0", "--port", "8010"]

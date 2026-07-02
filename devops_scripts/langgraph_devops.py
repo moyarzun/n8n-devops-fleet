@@ -55,10 +55,13 @@ FLEET_DB           = os.getenv("FLEET_DB", "/data/devops_store/devops.db")
 def _is_quota_error(exc: Exception) -> bool:
     if isinstance(exc, (RateLimitError,)):
         return True
-    if isinstance(exc, APIStatusError) and exc.status_code in (402, 403, 429, 500, 502, 503, 529):
+    if isinstance(exc, APIStatusError) and exc.status_code in (401, 402, 403, 429, 500, 502, 503, 529):
         return True
     msg = str(exc).lower()
-    return any(kw in msg for kw in ("429", "rate limit", "quota", "overload", "529", "capacity", "unavailable"))
+    return any(kw in msg for kw in (
+        "401", "429", "rate limit", "quota", "overload", "529",
+        "capacity", "unavailable", "login fail", "authorized_error",
+    ))
 
 def _make_minimax(temperature: float) -> ChatOpenAI:
     # Use placeholder when key is absent so the module can import without
@@ -86,7 +89,9 @@ _ANALYST_PRIMARY  = _make_minimax(0.1)
 _REVIEWER_PRIMARY = _make_minimax(0.0)
 
 _OR_ANALYST_CHAIN = [
-    _make_or("qwen/qwen3-coder:free", 0.1),
+    _make_or("meta-llama/llama-3.3-70b-instruct", 0.1),       # paid, barato ~$0.05/1M
+    _make_or("google/gemma-3-27b-it", 0.1),                    # paid, barato
+    _make_or("nvidia/nemotron-3-ultra-550b-a55b:free", 0.1),   # free fallback
     _make_or("nvidia/nemotron-3-super-120b-a12b:free", 0.1),
     _make_or("meta-llama/llama-3.3-70b-instruct:free", 0.1),
 ]
