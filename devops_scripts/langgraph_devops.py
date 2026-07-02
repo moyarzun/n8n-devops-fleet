@@ -124,6 +124,7 @@ def _db_init() -> None:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS deployment_events (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id  TEXT NOT NULL DEFAULT 'default',
                 ts          TEXT NOT NULL,
                 environment TEXT NOT NULL,
                 commit_sha  TEXT,
@@ -135,6 +136,7 @@ def _db_init() -> None:
             );
             CREATE TABLE IF NOT EXISTS incident_events (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id  TEXT NOT NULL DEFAULT 'default',
                 ts_start    TEXT NOT NULL,
                 ts_end      TEXT,
                 severity    TEXT,
@@ -145,11 +147,13 @@ def _db_init() -> None:
             );
             CREATE TABLE IF NOT EXISTS slo_definitions (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                name        TEXT NOT NULL UNIQUE,
+                project_id  TEXT NOT NULL DEFAULT 'default',
+                name        TEXT NOT NULL,
                 target_pct  REAL NOT NULL,
                 window_days INTEGER NOT NULL DEFAULT 30,
                 sli_query   TEXT,
-                created_at  TEXT NOT NULL
+                created_at  TEXT NOT NULL,
+                UNIQUE(project_id, name)
             );
             CREATE TABLE IF NOT EXISTS error_budget_log (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,6 +165,7 @@ def _db_init() -> None:
             );
             CREATE TABLE IF NOT EXISTS dora_snapshots (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id           TEXT NOT NULL DEFAULT 'default',
                 ts                   TEXT NOT NULL,
                 window_days          INTEGER NOT NULL,
                 deployment_frequency REAL,
@@ -172,6 +177,7 @@ def _db_init() -> None:
             );
             CREATE TABLE IF NOT EXISTS toil_catalog (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id  TEXT NOT NULL DEFAULT 'default',
                 name        TEXT NOT NULL,
                 frequency   TEXT,
                 time_min    INTEGER,
@@ -180,6 +186,15 @@ def _db_init() -> None:
                 detected_at TEXT NOT NULL
             );
         """)
+        # Migración: agregar project_id a tablas existentes si falta
+        for table in ("deployment_events", "incident_events", "dora_snapshots", "toil_catalog"):
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if "project_id" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN project_id TEXT NOT NULL DEFAULT 'default'")
+        for table in ("slo_definitions",):
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if "project_id" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN project_id TEXT NOT NULL DEFAULT 'default'")
         conn.commit()
         conn.close()
 
@@ -229,6 +244,9 @@ def _smoke_check(url: str, expected_status: int = 200, timeout: int = 15) -> tup
 
 class DeployState(TypedDict):
     # Input
+    project_id: str           # slug del proyecto, ej. "tennis-app"
+    github_owner: str         # override del env global
+    github_repo: str          # override del env global
     environment: str          # "production" | "staging" | "preview"
     commit_sha: str
     triggered_by: str
@@ -257,8 +275,10 @@ def _deploy_preflight_node(state: DeployState) -> dict:
     ok = True
 
     # 1. CI status via GitHub API
-    if GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO and state.get("commit_sha"):
-        result = _github_api("GET", f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits/{state['commit_sha']}/check-runs")
+    _owner = state.get("github_owner") or GITHUB_OWNER
+    _repo  = state.get("github_repo")  or GITHUB_REPO
+    if GITHUB_TOKEN and _owner and _repo and state.get("commit_sha"):
+        result = _github_api("GET", f"/repos/{_owner}/{_repo}/commits/{state['commit_sha']}/check-runs")
         runs = result.get("check_runs", [])
         failed = [r["name"] for r in runs if r.get("conclusion") == "failure"]
         if failed:
@@ -407,9 +427,11 @@ def _deploy_dora_record_node(state: DeployState) -> dict:
     _log("[DORA] Registrando evento de deployment...")
 
     # Lead time: tiempo desde commit hasta ahora (requiere timestamp del commit via GitHub)
+    _owner = state.get("github_owner") or GITHUB_OWNER
+    _repo  = state.get("github_repo")  or GITHUB_REPO
     lead_time_s = None
-    if GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO and state.get("commit_sha"):
-        result = _github_api("GET", f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits/{state['commit_sha']}")
+    if GITHUB_TOKEN and _owner and _repo and state.get("commit_sha"):
+        result = _github_api("GET", f"/repos/{_owner}/{_repo}/commits/{state['commit_sha']}")
         commit_date = result.get("commit", {}).get("author", {}).get("date")
         if commit_date:
             from dateutil.parser import parse as parse_date
@@ -425,9 +447,10 @@ def _deploy_dora_record_node(state: DeployState) -> dict:
     with _db_lock:
         conn = _db_connect()
         conn.execute("""
-            INSERT INTO deployment_events (ts, environment, commit_sha, status, lead_time_s, triggered_by)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO deployment_events (project_id, ts, environment, commit_sha, status, lead_time_s, triggered_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
+            state.get("project_id") or "default",
             datetime.now(timezone.utc).isoformat(),
             state.get("environment", "unknown"),
             state.get("commit_sha", ""),
@@ -477,11 +500,13 @@ def _deploy_notify_node(state: DeployState) -> dict:
     )
 
     # GitHub comment en el PR más reciente abierto
-    if GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO:
-        prs = _github_api("GET", f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/pulls?state=open&per_page=1")
+    _owner = state.get("github_owner") or GITHUB_OWNER
+    _repo  = state.get("github_repo")  or GITHUB_REPO
+    if GITHUB_TOKEN and _owner and _repo:
+        prs = _github_api("GET", f"/repos/{_owner}/{_repo}/pulls?state=open&per_page=1")
         if isinstance(prs, list) and prs:
             pr_number = prs[0]["number"]
-            _github_api("POST", f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/issues/{pr_number}/comments",
+            _github_api("POST", f"/repos/{_owner}/{_repo}/issues/{pr_number}/comments",
                         data={"body": body})
             _log(f"[NOTIFY] Comentado en PR #{pr_number}")
 
@@ -526,6 +551,9 @@ def build_deploy_pipeline() -> Any:
 
 class RemediateState(TypedDict):
     # Input
+    project_id: str
+    github_owner: str
+    github_repo: str
     alert_source: str        # "slo_breach" | "smoke_fail" | "ci_fail" | "manual"
     alert_message: str
     severity: str            # "P1" | "P2" | "P3"
@@ -773,9 +801,10 @@ def _mttr_record_node(state: RemediateState) -> dict:
     with _db_lock:
         conn = _db_connect()
         conn.execute("""
-            INSERT INTO incident_events (ts_start, ts_end, severity, root_cause, resolution, mttr_s)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO incident_events (project_id, ts_start, ts_end, severity, root_cause, resolution, mttr_s)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
+            state.get("project_id") or "default",
             ts_start, ts_end,
             state.get("severity", "P3"),
             state.get("root_cause", ""),
@@ -813,6 +842,7 @@ def build_remediate_pipeline() -> Any:
 # ===========================================================================
 
 class MetricsState(TypedDict):
+    project_id: str
     window_days: int
     report_type: str        # "dora" | "slo" | "full"
 
@@ -832,14 +862,15 @@ def _collect_events_node(state: MetricsState) -> dict:
     window = state.get("window_days", 7)
     cutoff = (datetime.now(timezone.utc) - timedelta(days=window)).isoformat()
 
+    project_id = state.get("project_id") or "default"
     with _db_lock:
         conn = _db_connect()
         deployments = [dict(r) for r in conn.execute("""
-            SELECT * FROM deployment_events WHERE ts >= ? ORDER BY ts DESC
-        """, (cutoff,)).fetchall()]
+            SELECT * FROM deployment_events WHERE ts >= ? AND project_id = ? ORDER BY ts DESC
+        """, (cutoff, project_id)).fetchall()]
         incidents = [dict(r) for r in conn.execute("""
-            SELECT * FROM incident_events WHERE ts_start >= ? ORDER BY ts_start DESC
-        """, (cutoff,)).fetchall()]
+            SELECT * FROM incident_events WHERE ts_start >= ? AND project_id = ? ORDER BY ts_start DESC
+        """, (cutoff, project_id)).fetchall()]
         conn.close()
 
     raw = json.dumps({"deployments": deployments, "incidents": incidents}, default=str)
@@ -905,13 +936,15 @@ def _dora_calc_node(state: MetricsState) -> dict:
     }
 
     # Persistir snapshot
+    project_id = state.get("project_id") or "default"
     with _db_lock:
         conn = _db_connect()
         conn.execute("""
             INSERT INTO dora_snapshots
-            (ts, window_days, deployment_frequency, lead_time_p50_h, lead_time_p90_h, mttr_h, change_failure_rate, dora_tier)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (project_id, ts, window_days, deployment_frequency, lead_time_p50_h, lead_time_p90_h, mttr_h, change_failure_rate, dora_tier)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
+            project_id,
             datetime.now(timezone.utc).isoformat(), window,
             dora["deployment_frequency_per_day"], dora["lead_time_p50_h"],
             dora["lead_time_p90_h"], dora["mttr_h"],

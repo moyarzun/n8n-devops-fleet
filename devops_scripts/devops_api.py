@@ -42,6 +42,9 @@ _executor = ThreadPoolExecutor(max_workers=int(os.getenv("FLEET_WORKERS", "6")))
 # ─── Modelos de request ───────────────────────────────────────────────────────
 
 class DeployRequest(BaseModel):
+    project_id: str = "default"
+    github_owner: str = ""
+    github_repo: str = ""
     environment: str = "staging"      # production | staging | preview
     commit_sha: str = ""
     triggered_by: str = "manual"
@@ -50,6 +53,9 @@ class DeployRequest(BaseModel):
 
 
 class RemediateRequest(BaseModel):
+    project_id: str = "default"
+    github_owner: str = ""
+    github_repo: str = ""
     alert_source: str = "manual"
     alert_message: str
     severity: str = "P2"              # P1 | P2 | P3
@@ -58,11 +64,13 @@ class RemediateRequest(BaseModel):
 
 
 class MetricsRequest(BaseModel):
+    project_id: str = "default"
     window_days: int = 7
     report_type: str = "full"         # dora | slo | full
 
 
 class SLODefinition(BaseModel):
+    project_id: str = "default"
     name: str
     target_pct: float                 # ej. 99.9
     window_days: int = 30
@@ -132,6 +140,9 @@ def _run_deploy(job_id: str, req: DeployRequest) -> None:
     pipeline = build_deploy_pipeline()
 
     initial: DeployState = {
+        "project_id":     req.project_id,
+        "github_owner":   req.github_owner,
+        "github_repo":    req.github_repo,
         "environment":    req.environment,
         "commit_sha":     req.commit_sha,
         "triggered_by":   req.triggered_by,
@@ -184,6 +195,9 @@ def _run_remediate(job_id: str, req: RemediateRequest) -> None:
     pipeline = build_remediate_pipeline()
 
     initial: RemediateState = {
+        "project_id":     req.project_id,
+        "github_owner":   req.github_owner,
+        "github_repo":    req.github_repo,
         "alert_source":   req.alert_source,
         "alert_message":  req.alert_message,
         "severity":       req.severity,
@@ -229,6 +243,7 @@ def _run_metrics(job_id: str, req: MetricsRequest) -> None:
     pipeline = build_metrics_pipeline()
 
     initial: MetricsState = {
+        "project_id":      req.project_id,
         "window_days":     req.window_days,
         "report_type":     req.report_type,
         "raw_events":      "",
@@ -246,7 +261,7 @@ def _run_metrics(job_id: str, req: MetricsRequest) -> None:
             _jobs[job_id].status = "success"
             _jobs[job_id].result = {
                 "dora_metrics": json.loads(final.get("dora_metrics", "{}")),
-                "report_preview": (final.get("report_markdown") or "")[:500],
+                "report_markdown": final.get("report_markdown") or "",
             }
             _jobs[job_id].finished_at = datetime.now(timezone.utc).isoformat()
     except Exception as exc:
@@ -298,13 +313,13 @@ def upsert_slo(slo: SLODefinition):
     with _db_lock:
         conn = _db_connect()
         conn.execute("""
-            INSERT INTO slo_definitions (name, target_pct, window_days, sli_query, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
+            INSERT INTO slo_definitions (project_id, name, target_pct, window_days, sli_query, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, name) DO UPDATE SET
                 target_pct=excluded.target_pct,
                 window_days=excluded.window_days,
                 sli_query=excluded.sli_query
-        """, (slo.name, slo.target_pct, slo.window_days, slo.sli_query,
+        """, (slo.project_id, slo.name, slo.target_pct, slo.window_days, slo.sli_query,
               datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
@@ -329,21 +344,23 @@ def list_jobs(limit: int = 20):
 
 
 @app.get("/metrics/dora")
-def get_dora_metrics():
+def get_dora_metrics(project_id: str = "default"):
     with _db_lock:
         conn = _db_connect()
         rows = [dict(r) for r in conn.execute("""
-            SELECT * FROM dora_snapshots ORDER BY ts DESC LIMIT 10
-        """).fetchall()]
+            SELECT * FROM dora_snapshots WHERE project_id = ? ORDER BY ts DESC LIMIT 10
+        """, (project_id,)).fetchall()]
         conn.close()
-    return {"snapshots": rows}
+    return {"project_id": project_id, "snapshots": rows}
 
 
 @app.get("/slo/budget")
-def get_slo_budget():
+def get_slo_budget(project_id: str = "default"):
     with _db_lock:
         conn = _db_connect()
-        slos = [dict(r) for r in conn.execute("SELECT * FROM slo_definitions").fetchall()]
+        slos = [dict(r) for r in conn.execute(
+            "SELECT * FROM slo_definitions WHERE project_id = ?", (project_id,)
+        ).fetchall()]
         latest_budgets = [dict(r) for r in conn.execute("""
             SELECT DISTINCT slo_id, remaining_pct, ts
             FROM error_budget_log
@@ -351,7 +368,7 @@ def get_slo_budget():
             HAVING ts = MAX(ts)
         """).fetchall()]
         conn.close()
-    return {"slos": slos, "budgets": latest_budgets}
+    return {"project_id": project_id, "slos": slos, "budgets": latest_budgets}
 
 
 @app.get("/events")
