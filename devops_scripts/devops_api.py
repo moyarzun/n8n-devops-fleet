@@ -326,6 +326,39 @@ def upsert_slo(slo: SLODefinition):
     return {"ok": True, "slo": slo.model_dump()}
 
 
+class DeploymentEvent(BaseModel):
+    project_id: str = "default"
+    environment: str = "production"
+    commit_sha: str = ""
+    status: str = "success"           # success | failure | rollback
+    triggered_by: str = "github-actions"
+    deploy_url: str = ""
+
+
+@app.post("/events/deployment")
+def record_deployment(ev: DeploymentEvent):
+    """Registra un deployment ya completado para métricas DORA.
+    Llamado por GitHub Actions después de un deploy exitoso."""
+    with _db_lock:
+        conn = _db_connect()
+        conn.execute("""
+            INSERT INTO deployment_events
+            (project_id, ts, environment, commit_sha, status, triggered_by, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ev.project_id,
+            datetime.now(timezone.utc).isoformat(),
+            ev.environment,
+            ev.commit_sha,
+            ev.status,
+            ev.triggered_by,
+            ev.deploy_url,
+        ))
+        conn.commit()
+        conn.close()
+    return {"ok": True, "project_id": ev.project_id, "status": ev.status}
+
+
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
     with _jobs_lock:
