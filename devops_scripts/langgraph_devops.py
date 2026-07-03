@@ -47,6 +47,8 @@ GITHUB_OWNER       = os.getenv("GITHUB_OWNER")
 GITHUB_REPO        = os.getenv("GITHUB_REPO")
 VERCEL_TOKEN       = os.getenv("VERCEL_TOKEN")
 VERCEL_PROJECT_ID  = os.getenv("VERCEL_PROJECT_ID")
+VERCEL_ORG_ID      = os.getenv("VERCEL_ORG_ID")
+GITHUB_REPO_ID     = os.getenv("GITHUB_REPO_ID")
 PRODUCTION_URL     = os.getenv("PRODUCTION_URL", "")
 STAGING_URL        = os.getenv("STAGING_URL", "")
 FLEET_DB           = os.getenv("FLEET_DB", "/data/devops_store/devops.db")
@@ -185,8 +187,25 @@ def _db_init() -> None:
                 notes       TEXT,
                 detected_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS project_configs (
+                project_id            TEXT PRIMARY KEY,
+                deploy_strategy       TEXT NOT NULL DEFAULT 'vercel',
+                github_owner          TEXT,
+                github_repo           TEXT,
+                github_repo_id        TEXT,
+                github_workflow       TEXT DEFAULT 'deploy.yml',
+                vercel_token          TEXT,
+                vercel_project_id     TEXT,
+                vercel_org_id         TEXT,
+                github_token          TEXT,
+                production_url        TEXT,
+                staging_url           TEXT,
+                smoke_urls            TEXT,
+                clerk_publishable_key TEXT,
+                updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
+            );
         """)
-        # Migración: agregar project_id a tablas existentes si falta
+        # Migración: agregar columnas faltantes en tablas existentes
         for table in ("deployment_events", "incident_events", "dora_snapshots", "toil_catalog"):
             cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if "project_id" not in cols:
@@ -195,8 +214,73 @@ def _db_init() -> None:
             cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if "project_id" not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN project_id TEXT NOT NULL DEFAULT 'default'")
+        # Migración: agregar clerk_publishable_key a project_configs si falta
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(project_configs)").fetchall()]
+        if "clerk_publishable_key" not in cols:
+            conn.execute("ALTER TABLE project_configs ADD COLUMN clerk_publishable_key TEXT")
         conn.commit()
         conn.close()
+
+# ─── Project config store ────────────────────────────────────────────────────
+def _project_get(project_id: str) -> dict:
+    """Retorna la config del proyecto desde la DB. Fallback a env vars si no existe."""
+    if not project_id:
+        return {}
+    with _db_lock:
+        conn = _db_connect()
+        row = conn.execute(
+            "SELECT * FROM project_configs WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        conn.close()
+    if row:
+        cfg = dict(row)
+        if cfg.get("smoke_urls"):
+            try:
+                cfg["smoke_urls"] = json.loads(cfg["smoke_urls"])
+            except Exception:
+                cfg["smoke_urls"] = []
+        return cfg
+    return {}
+
+def _project_upsert(project_id: str, **fields) -> None:
+    """Crea o actualiza la config de un proyecto."""
+    if "smoke_urls" in fields and isinstance(fields["smoke_urls"], list):
+        fields["smoke_urls"] = json.dumps(fields["smoke_urls"])
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    cols = list(fields.keys())
+    placeholders = ", ".join(["?"] * len(cols))
+    updates = ", ".join([f"{c} = excluded.{c}" for c in cols])
+    sql = (
+        f"INSERT INTO project_configs (project_id, {', '.join(cols)}) "
+        f"VALUES (?, {placeholders}) "
+        f"ON CONFLICT(project_id) DO UPDATE SET {updates}, updated_at = excluded.updated_at"
+    )
+    with _db_lock:
+        conn = _db_connect()
+        conn.execute(sql, [project_id] + list(fields.values()))
+        conn.commit()
+        conn.close()
+
+def _resolve_project_creds(state: dict) -> dict:
+    """Retorna credenciales efectivas: DB project_config > payload > env vars."""
+    project_id = state.get("project_id", "")
+    cfg = _project_get(project_id) if project_id else {}
+    return {
+        "github_token":      cfg.get("github_token")      or os.getenv("GITHUB_TOKEN", ""),
+        "github_owner":      cfg.get("github_owner")      or state.get("github_owner") or GITHUB_OWNER or "",
+        "github_repo":       cfg.get("github_repo")       or state.get("github_repo")  or GITHUB_REPO or "",
+        "github_repo_id":    cfg.get("github_repo_id")    or os.getenv("GITHUB_REPO_ID", ""),
+        "github_workflow":   cfg.get("github_workflow")   or state.get("github_workflow") or "deploy.yml",
+        "vercel_token":      cfg.get("vercel_token")      or VERCEL_TOKEN or "",
+        "vercel_project_id": cfg.get("vercel_project_id") or VERCEL_PROJECT_ID or "",
+        "vercel_org_id":     cfg.get("vercel_org_id")     or VERCEL_ORG_ID or "",
+        "production_url":    cfg.get("production_url")    or state.get("deploy_url") or PRODUCTION_URL or "",
+        "staging_url":       cfg.get("staging_url")       or STAGING_URL or "",
+        "deploy_strategy":        cfg.get("deploy_strategy")        or state.get("deploy_strategy") or "vercel",
+        "smoke_urls":             cfg.get("smoke_urls")             or state.get("extra_smoke_urls") or [],
+        "clerk_publishable_key":  cfg.get("clerk_publishable_key")  or "",
+    }
+
 
 # ─── Helpers de infraestructura ───────────────────────────────────────────────
 def _run(cmd: str, timeout: int = 120, cwd: str | None = None) -> tuple[int, str, str]:
@@ -223,6 +307,30 @@ def _github_api(method: str, path: str, data: dict | None = None) -> dict:
             return json.loads(resp.read())
     except Exception as exc:
         return {"error": str(exc)}
+
+def _smoke_check_clerk(url: str, expected_key: str) -> tuple[bool, str]:
+    """Descarga el HTML de url y valida que data-clerk-publishable-key coincide con expected_key.
+    Retorna (ok, nota). Si expected_key está vacío, omite la validación."""
+    import urllib.request, re
+    if not expected_key:
+        return True, "clerk: omitido (sin clave esperada configurada)"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "devops-fleet/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read(32768).decode("utf-8", errors="replace")
+        match = re.search(r'data-clerk-publishable-key="([^"]+)"', html)
+        if not match:
+            return False, "clerk: ✗ data-clerk-publishable-key ausente en el HTML"
+        actual_key = match.group(1)
+        if actual_key == expected_key:
+            return True, f"clerk: ✓ clave correcta ({expected_key[:20]}...)"
+        return False, (
+            f"clerk: ✗ CLAVE INCORRECTA — "
+            f"esperada={expected_key[:30]}... | "
+            f"encontrada={actual_key[:30]}..."
+        )
+    except Exception as exc:
+        return False, f"clerk: ✗ error al verificar HTML ({exc})"
 
 def _smoke_check(url: str, expected_status: int = 200, timeout: int = 15) -> tuple[bool, int]:
     """HTTP GET simple; retorna (ok, status_code)."""
@@ -251,7 +359,10 @@ class DeployState(TypedDict):
     commit_sha: str
     triggered_by: str
     workspace: str
-    deploy_url: str           # URL a validar post-deploy
+    deploy_url: str           # URL principal a validar post-deploy
+    deploy_strategy: str      # "vercel" | "github_actions" (default: "vercel")
+    github_workflow: str      # nombre del workflow file, ej. "deploy.yml"
+    extra_smoke_urls: list    # URLs adicionales para smoke test (multi-servicio)
 
     # Interno
     preflight_ok: bool
@@ -322,30 +433,229 @@ def _deploy_preflight_node(state: DeployState) -> dict:
     }
 
 
+def _vercel_api_deploy(commit_sha: str, environment: str, token: str = "", project_id: str = "", org_id: str = "", production_url: str = "") -> tuple[bool, str, str]:
+    """Dispara un deploy en Vercel vía API REST y espera a que quede READY.
+    Retorna (ok, mensaje, deployment_id).
+    """
+    import urllib.request, urllib.error, time
+    _token      = token      or VERCEL_TOKEN or ""
+    _project_id = project_id or VERCEL_PROJECT_ID or ""
+    _org_id     = org_id     or VERCEL_ORG_ID or ""
+    _repo_id    = GITHUB_REPO_ID or ""
+    if not _token or not _project_id:
+        return False, "VERCEL_TOKEN o VERCEL_PROJECT_ID no configurados", ""
+    if not _repo_id:
+        return False, "GITHUB_REPO_ID no configurado (requerido por Vercel API)", ""
+
+    target = "production" if environment == "production" else "preview"
+    payload = {
+        "name": GITHUB_REPO or "app-tennis",
+        "target": target,
+        "gitSource": {
+            "type": "github",
+            "repoId": _repo_id,
+            "ref": "main",
+            "sha": commit_sha,
+        },
+    }
+    body = json.dumps(payload).encode()
+    headers = {
+        "Authorization": f"Bearer {_token}",
+        "Content-Type": "application/json",
+    }
+    params = f"?projectId={_project_id}"
+    if _org_id:
+        params += f"&teamId={_org_id}"
+    url = f"https://api.vercel.com/v13/deployments{params}"
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+            deploy_id = data.get("id", "")
+            deploy_url = data.get("url", "")
+            ready_state = data.get("readyState", "INITIALIZING")
+            _log(f"[DEPLOY] Deployment iniciado: {deploy_id} ({ready_state})")
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode()[:500]}", ""
+    except Exception as exc:
+        return False, str(exc), ""
+
+    # Esperar hasta READY o ERROR (máx 10 min, poll cada 15s)
+    poll_url = f"https://api.vercel.com/v13/deployments/{deploy_id}"
+    if _org_id:
+        poll_url += f"?teamId={_org_id}"
+    poll_headers = {"Authorization": f"Bearer {_token}"}
+
+    for attempt in range(40):
+        time.sleep(15)
+        try:
+            poll_req = urllib.request.Request(poll_url, headers=poll_headers)
+            with urllib.request.urlopen(poll_req, timeout=15) as r:
+                poll_data = json.loads(r.read())
+                ready_state = poll_data.get("readyState", "?")
+                _log(f"[DEPLOY] [{attempt+1}/40] {deploy_id} → {ready_state}")
+                if ready_state == "READY":
+                    if target == "production":
+                        _vercel_promote(deploy_id, token=_token, org_id=_org_id, production_url=production_url)
+                    return True, f"READY: id={deploy_id} url=https://{deploy_url}", deploy_id
+                if ready_state in ("ERROR", "CANCELED"):
+                    return False, f"{ready_state}: id={deploy_id}", deploy_id
+        except Exception as exc:
+            _log(f"[DEPLOY] Poll error: {exc}")
+
+    return False, f"Timeout esperando READY: {deploy_id}", deploy_id
+
+
+def _vercel_promote(deploy_id: str, token: str = "", org_id: str = "", production_url: str = "") -> None:
+    """Asigna el alias de producción al deployment via POST /v2/deployments/{id}/aliases."""
+    import urllib.request, urllib.error
+    _token = token or VERCEL_TOKEN or ""
+    _prod_url = production_url or os.getenv("PRODUCTION_URL", "")
+    if not _token or not _prod_url:
+        _log("[DEPLOY] Promote omitido: VERCEL_TOKEN o PRODUCTION_URL no configurados")
+        return
+    alias = _prod_url.replace("https://", "").replace("http://", "").rstrip("/")
+    _org_id = org_id or VERCEL_ORG_ID or ""
+    url = f"https://api.vercel.com/v2/deployments/{deploy_id}/aliases"
+    if _org_id:
+        url += f"?teamId={_org_id}"
+    headers = {
+        "Authorization": f"Bearer {_token}",
+        "Content-Type": "application/json",
+    }
+    body = json.dumps({"alias": alias}).encode()
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+            old = data.get("oldDeploymentId", "")
+            _log(f"[DEPLOY] Alias {alias} → {deploy_id} (era: {old})")
+    except urllib.error.HTTPError as e:
+        _log(f"[DEPLOY] Alias error HTTP {e.code}: {e.read().decode()[:200]}")
+    except Exception as exc:
+        _log(f"[DEPLOY] Alias error: {exc}")
+
+
+def _github_actions_deploy(owner: str, repo: str, workflow: str, environment: str, commit_sha: str, token: str = "") -> tuple[bool, str]:
+    """Dispara un workflow_dispatch en GitHub Actions y espera que complete.
+    Timeout: 120×15s = 30 min (apto para builds con Docker + App Runner).
+    """
+    import urllib.request, urllib.error, time
+    _token = token or GITHUB_TOKEN
+    if not _token:
+        return False, "GITHUB_TOKEN no configurado"
+
+    branch = "main" if environment == "production" else environment
+    headers = {
+        "Authorization": f"Bearer {_token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    # Disparar workflow_dispatch
+    trigger_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow}/dispatches"
+    body = json.dumps({"ref": branch}).encode()
+    req = urllib.request.Request(trigger_url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            _log(f"[DEPLOY] GitHub Actions dispatch: HTTP {resp.status} — {owner}/{repo}/{workflow}@{branch}")
+    except urllib.error.HTTPError as e:
+        return False, f"Dispatch error HTTP {e.code}: {e.read().decode()[:300]}"
+    except Exception as exc:
+        return False, f"Dispatch error: {exc}"
+
+    # Esperar unos segundos para que el run aparezca en la API
+    time.sleep(10)
+
+    # Obtener el run más reciente del workflow
+    runs_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow}/runs?branch={branch}&per_page=1"
+    run_id = None
+    for _ in range(5):
+        try:
+            req = urllib.request.Request(runs_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read())
+                runs = data.get("workflow_runs", [])
+                if runs:
+                    run_id = runs[0]["id"]
+                    run_status = runs[0].get("status", "?")
+                    _log(f"[DEPLOY] Run encontrado: {run_id} ({run_status})")
+                    break
+        except Exception:
+            pass
+        time.sleep(5)
+
+    if not run_id:
+        return False, "No se encontró el workflow run tras el dispatch"
+
+    run_url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}"
+    actions_url = f"https://github.com/{owner}/{repo}/actions/runs/{run_id}"
+
+    # Polling hasta completion (máx 30 min)
+    for attempt in range(120):
+        time.sleep(15)
+        try:
+            req = urllib.request.Request(run_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                run_data = json.loads(r.read())
+                status = run_data.get("status", "?")
+                conclusion = run_data.get("conclusion")
+                _log(f"[DEPLOY] [{attempt+1}/120] Run {run_id}: {status}/{conclusion or '…'}")
+                if status == "completed":
+                    ok = conclusion == "success"
+                    return ok, f"GitHub Actions {conclusion}: {actions_url}"
+        except Exception as exc:
+            _log(f"[DEPLOY] Poll error: {exc}")
+
+    return False, f"Timeout esperando GitHub Actions: {actions_url}"
+
+
 def _deploy_execute_node(state: DeployState) -> dict:
     if not state.get("preflight_ok"):
         return {"deploy_ok": False, "deploy_output": "Omitido: preflight falló", "logs": ["DEPLOY: omitido"]}
 
     _log(f"[DEPLOY] Iniciando deploy a {state['environment']}...")
     env = state.get("environment", "staging")
+    commit_sha = state.get("commit_sha", "")
+    creds = _resolve_project_creds(state)
+    strategy = creds["deploy_strategy"]
 
-    if env == "production":
-        rc, out, err = _run("vercel deploy --prod --force 2>&1", timeout=600,
-                            cwd=state.get("workspace", "/workspace"))
-    elif env == "staging":
-        rc, out, err = _run("vercel deploy --target staging --force 2>&1", timeout=600,
-                            cwd=state.get("workspace", "/workspace"))
+    if strategy == "github_actions":
+        _log(f"[DEPLOY] Usando GitHub Actions: {creds['github_owner']}/{creds['github_repo']}/{creds['github_workflow']}")
+        ok, output = _github_actions_deploy(
+            creds["github_owner"], creds["github_repo"],
+            creds["github_workflow"], env, commit_sha,
+            token=creds["github_token"],
+        )
+    elif creds["vercel_project_id"] and creds["vercel_token"] and commit_sha:
+        _log("[DEPLOY] Usando Vercel API (sin build local)...")
+        ok, output, _ = _vercel_api_deploy(
+            commit_sha, env,
+            token=creds["vercel_token"],
+            project_id=creds["vercel_project_id"],
+            org_id=creds["vercel_org_id"],
+            production_url=creds["production_url"],
+        )
     else:
-        rc, out, err = _run("vercel deploy --force 2>&1", timeout=600,
-                            cwd=state.get("workspace", "/workspace"))
+        # Fallback: CLI (requiere Node.js con suficiente memoria)
+        if env == "production":
+            rc, out, err = _run("vercel deploy --prod --force 2>&1", timeout=600,
+                                cwd=state.get("workspace", "/workspace"))
+        elif env == "staging":
+            rc, out, err = _run("vercel deploy --target staging --force 2>&1", timeout=600,
+                                cwd=state.get("workspace", "/workspace"))
+        else:
+            rc, out, err = _run("vercel deploy --force 2>&1", timeout=600,
+                                cwd=state.get("workspace", "/workspace"))
+        ok = rc == 0
+        output = (out + "\n" + err).strip()
 
-    ok = rc == 0
-    output = (out + "\n" + err).strip()
-    _log(f"[DEPLOY] {'✓ OK' if ok else '✗ FALLÓ'} (rc={rc})")
+    _log(f"[DEPLOY] {'✓ OK' if ok else '✗ FALLÓ'}")
     return {
         "deploy_ok": ok,
         "deploy_output": output[:2000],
-        "logs": [f"DEPLOY: {'OK' if ok else f'FALLÓ rc={rc}'} — {output[:200]}"],
+        "logs": [f"DEPLOY: {'OK' if ok else 'FALLÓ'} — {output[:200]}"],
     }
 
 
@@ -353,30 +663,59 @@ def _deploy_smoke_node(state: DeployState) -> dict:
     if not state.get("deploy_ok"):
         return {"smoke_ok": False, "smoke_notes": "Omitido: deploy falló", "logs": ["SMOKE: omitido"]}
 
-    url = state.get("deploy_url") or PRODUCTION_URL or STAGING_URL
+    creds = _resolve_project_creds(state)
+    url = state.get("deploy_url") or creds.get("production_url") or PRODUCTION_URL or STAGING_URL
     if not url:
         return {"smoke_ok": True, "smoke_notes": "Sin URL configurada — omitido", "logs": ["SMOKE: sin URL"]}
 
     _log(f"[SMOKE] Verificando {url}...")
     notes = []
+    all_ok = True
 
+    # Smoke del servicio principal
     ok_home, code_home = _smoke_check(url + "/", expected_status=200)
-    notes.append(f"home: {code_home} {'✓' if code_home in (200, 307, 302) else '✗'}")
+    home_ok = code_home in (200, 307, 302)
+    notes.append(f"home: {code_home} {'✓' if home_ok else '✗'}")
+    if not home_ok:
+        all_ok = False
 
     ok_api, code_api = _smoke_check(url + "/api/health")
-    notes.append(f"health: {code_api} {'✓' if code_api in (200, 404) else '✗'}")
+    health_ok = code_api == 200
+    notes.append(f"health: {code_api} {'✓' if health_ok else '✗'}")
+    if not health_ok:
+        all_ok = False
 
-    # E2E endpoint NO debe existir en producción
-    if "vercel.app" not in url:
+    # Validación de Clerk: compara la clave embebida en el HTML vs la clave esperada
+    clerk_ok, clerk_note = _smoke_check_clerk(url + "/", creds.get("clerk_publishable_key", ""))
+    notes.append(clerk_note)
+    if not clerk_ok:
+        all_ok = False
+
+    # E2E gate: solo en preview
+    if "vercel.app" in url:
         ok_e2e, code_e2e = _smoke_check(url + "/api/e2e/login?email=x@x.com")
-        notes.append(f"e2e-gate: {code_e2e} {'✓ (404=correcto)' if code_e2e == 404 else '✗ (expuesto!)'}")
+        notes.append(f"e2e-gate: {code_e2e} {'✓' if code_e2e in (200, 307, 302) else '✗'}")
 
-    overall_ok = code_home in (200, 307, 302) and code_api in (200, 404)
-    _log(f"[SMOKE] {'✓ OK' if overall_ok else '✗ FALLÓ'} — {'; '.join(notes)}")
+    # Smoke de URLs extra (multi-servicio): config de la DB del proyecto
+    extra_urls = creds.get("smoke_urls") or []
+    for entry in extra_urls:
+        # Formato: {"url": "...", "path": "/...", "expect": 200, "label": "..."}
+        if isinstance(entry, str):
+            entry = {"url": entry, "path": "/", "expect": 200, "label": entry}
+        check_url = entry["url"].rstrip("/") + entry.get("path", "/")
+        expect    = entry.get("expect", 200)
+        label     = entry.get("label", entry["url"])
+        _, code   = _smoke_check(check_url)
+        entry_ok  = code == expect or (expect == 200 and code in (200, 307, 302))
+        notes.append(f"{label}: {code} {'✓' if entry_ok else '✗'}")
+        if not entry_ok:
+            all_ok = False
+
+    _log(f"[SMOKE] {'✓ OK' if all_ok else '✗ FALLÓ'} — {'; '.join(notes)}")
     return {
-        "smoke_ok": overall_ok,
+        "smoke_ok": all_ok,
         "smoke_notes": "; ".join(notes),
-        "logs": [f"SMOKE: {'OK' if overall_ok else 'FALLÓ'} — {'; '.join(notes)}"],
+        "logs": [f"SMOKE: {'OK' if all_ok else 'FALLÓ'} — {'; '.join(notes)}"],
     }
 
 

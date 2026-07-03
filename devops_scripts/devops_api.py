@@ -33,6 +33,7 @@ from langgraph_devops import (
     build_deploy_pipeline, build_remediate_pipeline, build_metrics_pipeline,
     DeployState, RemediateState, MetricsState,
     set_log_callback, _db_connect, _db_lock, FLEET_DB,
+    _project_get, _project_upsert,
 )
 
 app = FastAPI(title="DevOps Fleet API", version="1.0.0")
@@ -50,6 +51,25 @@ class DeployRequest(BaseModel):
     triggered_by: str = "manual"
     workspace: str = "/workspace"
     deploy_url: str = ""
+    deploy_strategy: str = ""         # "vercel" | "github_actions" — si vacío, usa la config del proyecto
+    github_workflow: str = ""         # nombre del workflow file (solo para github_actions)
+    extra_smoke_urls: list = []       # URLs extra para smoke test (multi-servicio)
+
+
+class ProjectConfigRequest(BaseModel):
+    deploy_strategy: Optional[str] = None
+    github_owner: Optional[str] = None
+    github_repo: Optional[str] = None
+    github_repo_id: Optional[str] = None
+    github_workflow: Optional[str] = None
+    github_token: Optional[str] = None
+    vercel_token: Optional[str] = None
+    vercel_project_id: Optional[str] = None
+    vercel_org_id: Optional[str] = None
+    production_url: Optional[str] = None
+    staging_url: Optional[str] = None
+    smoke_urls: Optional[list] = None
+    clerk_publishable_key: Optional[str] = None
 
 
 class RemediateRequest(BaseModel):
@@ -140,14 +160,17 @@ def _run_deploy(job_id: str, req: DeployRequest) -> None:
     pipeline = build_deploy_pipeline()
 
     initial: DeployState = {
-        "project_id":     req.project_id,
-        "github_owner":   req.github_owner,
-        "github_repo":    req.github_repo,
-        "environment":    req.environment,
-        "commit_sha":     req.commit_sha,
-        "triggered_by":   req.triggered_by,
-        "workspace":      req.workspace,
-        "deploy_url":     req.deploy_url,
+        "project_id":       req.project_id,
+        "github_owner":     req.github_owner,
+        "github_repo":      req.github_repo,
+        "environment":      req.environment,
+        "commit_sha":       req.commit_sha,
+        "triggered_by":     req.triggered_by,
+        "workspace":        req.workspace,
+        "deploy_url":       req.deploy_url,
+        "deploy_strategy":  req.deploy_strategy,
+        "github_workflow":  req.github_workflow,
+        "extra_smoke_urls": req.extra_smoke_urls,
         "preflight_ok":   False,
         "preflight_notes": "",
         "deploy_ok":      False,
@@ -428,6 +451,25 @@ async def sse_events(request: Request):
 
     return StreamingResponse(generator(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/projects/{project_id}")
+def get_project(project_id: str):
+    cfg = _project_get(project_id)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"Proyecto '{project_id}' no registrado")
+    # Ocultar tokens en la respuesta
+    for secret_key in ("github_token", "vercel_token"):
+        if cfg.get(secret_key):
+            cfg[secret_key] = "***"
+    return cfg
+
+
+@app.put("/projects/{project_id}")
+def upsert_project(project_id: str, body: ProjectConfigRequest):
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    _project_upsert(project_id, **fields)
+    return {"project_id": project_id, "updated": list(fields.keys())}
 
 
 @app.get("/", response_class=HTMLResponse)
